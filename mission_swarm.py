@@ -66,7 +66,7 @@ import threading
 LAYER_OFFSET = 0.5  # Vertical separation between drones during transitions
 FORMATION_DISTANCE = 1.0  # Distance between drones in formation
 CIRCLE_POINTS = 36  # Number of points to discretize the circle
-FLIGHT_SPEED = 1.0  # Speed for drone movement (m/s)
+FLIGHT_SPEED = 0.8  # Speed for drone movement (m/s)
 FORMATION_CHANGE_INTERVAL = 20  # Number of waypoints before changing formation
 
 STAGE3_GRID_RESOLUTION = 0.4  # Grid resolution in meters
@@ -536,9 +536,11 @@ class SwarmConductor:
         
         # Update current formation
         self.current_formation = new_formation
+        # Wait for all drones to be ready
+        self.wait_all_drones()
         print(f"Formation changed to {new_formation}")
 
-    def apply_formation_at_current_position(self, use_layered: bool = False):
+    def apply_formation_at_current_position(self, use_layered: bool = True):
         """Apply the current formation at the current leader position
         
         Args:
@@ -1597,6 +1599,8 @@ class SwarmConductor:
                                      0.0, 
                                      "earth", 
                                      False)
+                # else:
+                #     print(f"Drone {i} is safe") # Debug print, remove later
                 
                 # Check if drone has reached its target
                 drone_pos = drone.position
