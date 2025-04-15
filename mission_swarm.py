@@ -293,6 +293,12 @@ class Dancer(DroneInterface):
         self.current_behavior = getattr(self, beh)
         self.current_behavior(*args)
 
+    def stop_behavior(self):
+        """Stop current behavior"""
+        if self.current_behavior:
+            self.current_behavior.stop()
+            self.current_behavior = None
+
     def goal_reached(self) -> bool:
         """Check if current behavior has finished"""
         if not self.current_behavior:
@@ -1559,6 +1565,47 @@ def confirm(msg: str = 'Continue') -> bool:
         return True
     return False
 
+def test_code():
+    # Test interrupting a behavior
+    # Start a drone, goto [5, 5, 5], wait=false, and then stop the behavior
+    conductor = SwarmConductor(['drone2'], use_sim_time=True)
+    conductor.get_ready()
+    conductor.takeoff()
+    drone = conductor.drones[0]
+    drone.do_behavior("go_to", 
+                                 5.0,
+                                 5.0,
+                                 5.0,
+                                 FLIGHT_SPEED,
+                                 YawMode.PATH_FACING, 
+                                 0.0, 
+                                 "earth", 
+                                 False)
+
+    position = drone.position
+    print(f"Drone position: {position}")
+
+    # Wait a random time between 1 and 5 seconds
+    time.sleep(1)
+    drone.stop_behavior()
+    time.sleep(1)
+    
+    position = drone.position
+    print(f"Drone position: {position}")
+
+    drone.do_behavior("go_to", 
+                                 5.0,
+                                 5.0,
+                                 5.0,
+                                 FLIGHT_SPEED,
+                                 YawMode.PATH_FACING, 
+                                 0.0, 
+                                 "earth", 
+                                 False)
+    
+    position = drone.position
+    print(f"Drone position: {position}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1590,10 +1637,16 @@ def main():
     config = read_config_from_yaml(config_path)
 
     rclpy.init()
+
+    test_code()
+    sys.exit(0)
+
     swarm = SwarmConductor(
         drones_namespace,
         verbose=verbosity,
         use_sim_time=use_sim_time)
+    
+    
 
     if confirm("Takeoff"):
         swarm.get_ready()
