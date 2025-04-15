@@ -34,6 +34,8 @@ __authors__ = 'Rafael Perez-Segui, Miguel Fernandez-Cortizas'
 __copyright__ = 'Copyright (c) 2024 Universidad Politécnica de Madrid'
 __license__ = 'BSD-3-Clause'
 
+# Configuration macros
+STAGE2_METHOD = "lineY"  # Options: "sequential" or "lineY"
 
 import argparse
 import sys
@@ -73,7 +75,20 @@ class FormationManager:
 
     @staticmethod
     def line_formation(num_drones: int, distance: float = FORMATION_DISTANCE) -> List[List[float]]:
-        """Generate a line formation with specified number of drones
+        """Generate a line formation along X-axis with specified number of drones
+        
+        Args:
+            num_drones: Number of drones in the formation
+            distance: Distance between adjacent drones
+            
+        Returns:
+            List of [x, y] offsets for each drone relative to the leader
+        """
+        return FormationManager.lineX_formation(num_drones, distance)
+
+    @staticmethod
+    def lineX_formation(num_drones: int, distance: float = FORMATION_DISTANCE) -> List[List[float]]:
+        """Generate a line formation along X-axis with specified number of drones
         
         Args:
             num_drones: Number of drones in the formation
@@ -105,6 +120,32 @@ class FormationManager:
         # Combine all positions with leader at index 0
         offsets.extend(left_side[::-1])  # Reverse left side to maintain order
         offsets.extend(right_side)
+            
+        return offsets
+
+    @staticmethod
+    def lineY_formation(num_drones: int, distance: float = FORMATION_DISTANCE) -> List[List[float]]:
+        """Generate a line formation along Y-axis with specified number of drones
+        
+        Args:
+            num_drones: Number of drones in the formation
+            distance: Distance between adjacent drones
+            
+        Returns:
+            List of [x, y] offsets for each drone relative to the leader
+        """
+        offsets = []
+        
+        if num_drones == 1:
+            return [[0.0, 0.0]]
+            
+        # Leader (drone0) is at the front of the line
+        offsets.append([0.0, 0.0])  # Leader at front
+        
+        # Calculate positions for followers (all behind the leader)
+        for i in range(1, num_drones):
+            # Drones behind the leader along Y axis
+            offsets.append([0.0, -i * distance])
             
         return offsets
 
@@ -154,24 +195,27 @@ class FormationManager:
         return offsets
 
     @staticmethod
-    def get_formation_offsets(formation_type: str, num_drones: int) -> List[List[float]]:
+    def get_formation_offsets(formation_type: str, num_drones: int, distance: float = FORMATION_DISTANCE) -> List[List[float]]:
         """Get offsets for the specified formation type
         
         Args:
-            formation_type: Type of formation ("line", "v", etc.)
+            formation_type: Type of formation ("line", "lineX", "lineY", "v", etc.)
             num_drones: Number of drones in the formation
+            distance: Distance between drones in the formation
             
         Returns:
             List of [x, y] offsets for each drone relative to the leader
         """
-        if formation_type.lower() == "line":
-            return FormationManager.line_formation(num_drones)
+        if formation_type.lower() == "line" or formation_type.lower() == "linex":
+            return FormationManager.lineX_formation(num_drones, distance)
+        elif formation_type.lower() == "liney":
+            return FormationManager.lineY_formation(num_drones, distance)
         elif formation_type.lower() == "v":
-            return FormationManager.v_formation(num_drones)
+            return FormationManager.v_formation(num_drones, distance)
         else:
             # Default to line formation if unknown type
             print(f"Unknown formation type: {formation_type}. Using line formation.")
-            return FormationManager.line_formation(num_drones)
+            return FormationManager.lineX_formation(num_drones, distance)
 
 
 class CircularTrajectoryGenerator:
@@ -376,40 +420,40 @@ class SwarmConductor:
         """Change the formation of the swarm
         
         Args:
-            new_formation: Name of the new formation
+            new_formation: New formation type
         """
-        print(f"Changing formation to: {new_formation}")
-        self.current_formation = new_formation
+        print(f"Changing formation to {new_formation}")
+        
+        # Check if we're already in the requested formation
+        if hasattr(self, 'current_formation') and self.current_formation == new_formation:
+            # Check if drones are already in the correct positions
+            if self.is_formation_achieved():
+                print(f"Formation {new_formation} is already achieved, skipping formation change")
+                return
         
         # Get formation offsets for the new formation
         self.formation_offsets = FormationManager.get_formation_offsets(
-            new_formation, len(self.drones))
+            new_formation, len(self.drones), FORMATION_DISTANCE)
         
         # Apply the new formation at the current leader position
-        self.apply_formation_at_current_position()
+        self.apply_formation_at_current_position(use_layered=True)
         
-    def apply_formation_at_current_position(self):
-        """Apply the current formation at the leader's current position"""
+        # Update current formation
+        self.current_formation = new_formation
+        print(f"Formation changed to {new_formation}")
+
+    def apply_formation_at_current_position(self, use_layered: bool = False):
+        """Apply the current formation at the current leader position
+        
+        Args:
+            use_layered: Whether to use layered approach for collision avoidance
+        """
         # Get leader position
-        leader_position = self.leader.position
+        leader_pos = self.leader.position
         
-        # Move each drone to its position in the formation
-        for i, drone in self.drones.items():
-            if i == 0:  # Leader stays in place
-                continue
-                
-            # Calculate target position based on formation offset
-            offset = self.formation_offsets[i]
-            target_x = leader_position[0] + offset[0]
-            target_y = leader_position[1] + offset[1]
-            target_z = leader_position[2]
-            
-            # Move drone to target position using layered approach
-            drone.go_to_layered([target_x, target_y, target_z])
-            
-        # Wait for all drones to reach their positions
-        self.wait_all_drones()
-        
+        # Move swarm to maintain formation at current position
+        self._move_swarm_to_position(leader_pos, use_layered=use_layered)
+
     def initialize_circle_trajectory(self, center: List[float], diameter: float):
         """Initialize the circular trajectory
         
@@ -534,7 +578,7 @@ class SwarmConductor:
             time.sleep(0.1)
 
     def execute_stage2(self, config: dict):
-        """Execute stage 2 - window traversal with sequential drone movement
+        """Execute stage 2 - window traversal
         
         Args:
             config: Configuration dictionary from YAML file
@@ -545,25 +589,21 @@ class SwarmConductor:
         room_height = stage2_config.get('room_height', 5.0)
         windows = stage2_config.get('windows', {})
         
-        print(f"Executing Stage 2 with center={stage_center}")
+        # Get traversal method from global macro
+        traversal_method = STAGE2_METHOD
         
-        # Initialize with V formation
-        self.change_formation("v")
+        print(f"Executing Stage 2 with center={stage_center}, method={traversal_method}")
         
-        # Define waypoints for the leader
-        # First window parameters
+        # Define window parameters
         window1 = windows.get('1', {})
-        window1_center = window1.get('center', [-0.5, 1.5])  # y, x format in YAML
-        # window1_center = [window1_center[1], window1_center[0]]  # Convert to x, y
+        window1_center = window1.get('center', [-0.5, 1.5])
         window1_width = window1.get('gap_width', 2.0)
         window1_height = window1.get('height', 2.0)
         window1_floor = window1.get('distance_floor', 1.0)
         window1_thickness = window1.get('thickness', 0.3)
         
-        # Second window parameters
         window2 = windows.get('2', {})
-        window2_center = window2.get('center', [1.0, -2.5])  # y, x format in YAML
-        # window2_center = [window2_center[1], window2_center[0]]  # Convert to x, y
+        window2_center = window2.get('center', [1.0, -2.5])
         window2_width = window2.get('gap_width', 1.0)
         window2_height = window2.get('height', 1.5)
         window2_floor = window2.get('distance_floor', 3.0)
@@ -575,38 +615,58 @@ class SwarmConductor:
         window2_abs_center = [stage_center[0] + window2_center[0], 
                               stage_center[1] + window2_center[1]]
         
-        # Define waypoints for the leader's path
-        # Starting position before first window
+        # Define waypoints for the path
         start_pos = [window1_abs_center[0], window1_abs_center[1] + 3.0, 1.5]
-        
-        # Position just before first window
         pre_window1_pos = [window1_abs_center[0], window1_abs_center[1] + 1.0, 
                            window1_floor + window1_height/2]
-        
-        # Position just after first window
         post_window1_pos = [window1_abs_center[0], window1_abs_center[1] - window1_thickness - 1.0, 
                             window1_floor + window1_height/2]
-        
-        # Position before second window
         pre_window2_pos = [window2_abs_center[0], window2_abs_center[1] + 1.0, 
                            window2_floor + window2_height/2]
-        
-        # Position after second window
         post_window2_pos = [window2_abs_center[0], window2_abs_center[1] - window2_thickness - 1.0, 
                             window2_floor + window2_height/2]
-        
-        # Final position
         end_pos = [window2_abs_center[0], window2_abs_center[1] - 3.0, 1.5]
         
-        print("Stage 2: Moving to start position")
-
         print(f"Start position: {start_pos}")
+        print(f"Pre window 1 position: {pre_window1_pos}")
         print(f"Post window 1 position: {post_window1_pos}")
         print(f"Pre window 2 position: {pre_window2_pos}")
         print(f"Post window 2 position: {post_window2_pos}")
         print(f"End position: {end_pos}")
         
-        # First move the swarm to the starting position in V formation
+        # Choose traversal method based on configuration
+        if traversal_method.lower() == 'sequential':
+            self._execute_stage2_sequential(
+                start_pos, pre_window1_pos, post_window1_pos, 
+                pre_window2_pos, post_window2_pos, end_pos)
+        elif traversal_method.lower() == 'liney':
+            self._execute_stage2_lineY(
+                start_pos, pre_window1_pos, post_window1_pos, 
+                pre_window2_pos, post_window2_pos, end_pos)
+        else:
+            print(f"Unknown traversal method: {traversal_method}. Using lineY method.")
+            self._execute_stage2_lineY(
+                start_pos, pre_window1_pos, post_window1_pos, 
+                pre_window2_pos, post_window2_pos, end_pos)
+
+    def _execute_stage2_sequential(self, start_pos, pre_window1_pos, post_window1_pos, 
+                                  pre_window2_pos, post_window2_pos, end_pos):
+        """Execute stage 2 using sequential traversal method
+        
+        Args:
+            start_pos: Starting position
+            pre_window1_pos: Position before window 1
+            post_window1_pos: Position after window 1
+            pre_window2_pos: Position before window 2
+            post_window2_pos: Position after window 2
+            end_pos: Final position
+        """
+        print("Stage 2: Using sequential traversal method")
+        
+        # Initialize with V formation
+        self.change_formation("v")
+        
+        # Move the swarm to the starting position in V formation
         self._move_swarm_to_position(start_pos)
         
         print("Stage 2: Sequential window traversal starting")
@@ -715,26 +775,58 @@ class SwarmConductor:
             print(f"Stage 2: Drone {i} completed window traversal")
         
         print("Stage 2: All drones have traversed the windows")
-        print("Stage 2 completed")
 
-    def _move_swarm_to_position(self, leader_position: List[float]):
+    def _execute_stage2_lineY(self, start_pos, pre_window1_pos, post_window1_pos, 
+                             pre_window2_pos, post_window2_pos, end_pos):
+        """Execute stage 2 using lineY formation traversal method
+        
+        Args:
+            start_pos: Starting position
+            pre_window1_pos: Position before window 1
+            post_window1_pos: Position after window 1
+            pre_window2_pos: Position before window 2
+            post_window2_pos: Position after window 2
+            end_pos: Final position
+        """
+        print("Stage 2: Using lineY formation traversal method")
+        
+        # Start directly with lineY formation with reduced distance for window traversal
+        WINDOW_FORMATION_DISTANCE = 0.4  # Reduced distance for window traversal
+        self.formation_offsets = FormationManager.get_formation_offsets(
+            "lineY", len(self.drones), WINDOW_FORMATION_DISTANCE)
+        self.current_formation = "lineY"
+        
+        # Move the swarm to the starting position in lineY formation
+        self._move_swarm_to_position(start_pos, use_layered=True)
+        
+        print("Stage 2: LineY formation window traversal starting")
+        
+        # Create a path for the entire formation to follow
+        waypoints = [
+            pre_window1_pos,
+            post_window1_pos,
+            pre_window2_pos,
+            post_window2_pos,
+            end_pos
+        ]
+        
+        # For each waypoint, move the entire formation
+        for i, waypoint in enumerate(waypoints):
+            print(f"Stage 2: Moving to waypoint {i+1}/{len(waypoints)}")
+            self._move_swarm_to_position(waypoint)
+        
+        # Change back to V formation at the end
+        self.change_formation("v")
+        
+        print("Stage 2: LineY formation traversal completed")
+
+    def _move_swarm_to_position(self, leader_position: List[float], use_layered: bool = False):
         """Move the entire swarm to a new position while maintaining formation
         
         Args:
             leader_position: [x, y, z] target position for the leader
+            use_layered: Whether to use layered approach for collision avoidance
         """
-        # Create path for leader (just a single point in this case)
-        leader_path = Path()
-        leader_path.header.stamp = self.leader.get_clock().now().to_msg()
-        leader_path.header.frame_id = "earth"
-        
-        # Add waypoint to leader path
-        pose = PoseStamped()
-        pose.pose.position.x = leader_position[0]
-        pose.pose.position.y = leader_position[1]
-        pose.pose.position.z = leader_position[2]
-        leader_path.poses.append(pose)
-        
         # Command leader to move to the position
         self.leader.do_behavior("go_to", 
                                leader_position[0],
@@ -744,7 +836,7 @@ class SwarmConductor:
                                YawMode.PATH_FACING, 
                                0.0, 
                                "earth", 
-                               False)  # Wait for leader to reach position
+                               False)  # Don't wait - we'll wait for all drones together
         
         # Move followers to maintain formation
         for i, drone in self.drones.items():
@@ -759,11 +851,66 @@ class SwarmConductor:
             target_y = leader_position[1] + offset[1]
             target_z = leader_position[2]
             
-            # Move follower to its position using layered approach
-            drone.go_to_layered([target_x, target_y, target_z])
+            # Move follower to its position
+            if use_layered:
+                # Use layered approach for collision avoidance during formation changes
+                drone.go_to_layered([target_x, target_y, target_z])
+            else:
+                # Direct movement when formation is already established
+                drone.do_behavior("go_to", 
+                                 target_x,
+                                 target_y,
+                                 target_z,
+                                 FLIGHT_SPEED,
+                                 YawMode.PATH_FACING, 
+                                 0.0, 
+                                 "earth", 
+                                 False)
         
         # Wait for all drones to reach their positions
         self.wait_all_drones()
+
+    def is_formation_achieved(self) -> bool:
+        """Check if the current formation matches the desired formation
+        
+        Returns:
+            bool: True if formation is achieved, False otherwise
+        """
+        FORMATION_TOLERANCE = 0.1  # 10cm tolerance
+        
+        # Skip check if we don't have formation offsets yet
+        if not hasattr(self, 'formation_offsets') or not self.formation_offsets:
+            return False
+        
+        # Get leader position
+        leader_pos = self.leader.position
+        
+        # Check each follower's position against expected position
+        for i, drone in self.drones.items():
+            if i == 0:  # Skip leader
+                continue
+            
+            # Get current position
+            current_pos = drone.position
+            
+            # Get expected position based on formation offset
+            offset = self.formation_offsets[i]
+            expected_x = leader_pos[0] + offset[0]
+            expected_y = leader_pos[1] + offset[1]
+            expected_z = leader_pos[2]
+            
+            # Calculate distance to expected position
+            dx = current_pos[0] - expected_x
+            dy = current_pos[1] - expected_y
+            dz = current_pos[2] - expected_z
+            distance = math.sqrt(dx*dx + dy*dy + dz*dz)
+            
+            # If any drone is not in position, formation is not achieved
+            if distance > FORMATION_TOLERANCE:
+                return False
+        
+        # All drones are in position
+        return True
 
 
 def confirm(msg: str = 'Continue') -> bool:
@@ -793,7 +940,7 @@ def main():
                         help='Use simulation time')
     parser.add_argument('-c', '--config',
                         type=str,
-                        default='src/challenge_multi_drone/scenarios/scenario2.yaml',
+                        default='src/challenge_multi_drone/scenarios/scenario1.yaml',
                         help='Path to the config file')
 
     args = parser.parse_args()
