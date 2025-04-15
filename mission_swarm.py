@@ -801,8 +801,9 @@ class SwarmConductor:
         
         print("Stage 2: LineY formation window traversal starting")
         
-        # Create a path for the entire formation to follow
+        # Define all waypoints for the path
         waypoints = [
+            start_pos,
             pre_window1_pos,
             post_window1_pos,
             pre_window2_pos,
@@ -810,14 +811,46 @@ class SwarmConductor:
             end_pos
         ]
         
-        # For each waypoint, move the entire formation
-        for i, waypoint in enumerate(waypoints):
-            print(f"Stage 2: Moving to waypoint {i+1}/{len(waypoints)}")
-            self._move_swarm_to_position(waypoint)
+        # Create paths for each drone to follow
+        for i, drone in self.drones.items():
+            # Create a path for this drone
+            path = Path()
+            path.header.stamp = drone.get_clock().now().to_msg()
+            path.header.frame_id = "earth"
+            
+            # Add waypoints to the path with appropriate offsets
+            for waypoint in waypoints:
+                pose = PoseStamped()
+                
+                if i == 0:  # Leader follows the main path
+                    pose.pose.position.x = waypoint[0]
+                    pose.pose.position.y = waypoint[1]
+                    pose.pose.position.z = waypoint[2]
+                else:  # Followers maintain formation
+                    # Get offset for this drone
+                    offset = self.formation_offsets[i]
+                    
+                    # Apply offset to waypoint
+                    pose.pose.position.x = waypoint[0] + offset[0]
+                    pose.pose.position.y = waypoint[1] + offset[1]
+                    pose.pose.position.z = waypoint[2]
+                
+                path.poses.append(pose)
+            
+            # Command drone to follow the path
+            print(f"Stage 2: Drone {i} following window traversal path")
+            drone.do_behavior("follow_path", 
+                             path, 
+                             FLIGHT_SPEED,
+                             YawMode.PATH_FACING, 
+                             0.0, 
+                             "earth", 
+                             False)  # Don't wait - we'll wait for all drones together
         
-        # Change back to V formation at the end
-        self.change_formation("v")
+        # Wait for all drones to complete their paths
+        self.wait_all_drones()
         
+        # Keep lineY formation at the end (no need to change)
         print("Stage 2: LineY formation traversal completed")
 
     def _move_swarm_to_position(self, leader_position: List[float], use_layered: bool = False):
