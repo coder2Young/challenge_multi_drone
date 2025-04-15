@@ -62,13 +62,13 @@ from queue import PriorityQueue
 LAYER_OFFSET = 0.5  # Vertical separation between drones during transitions
 FORMATION_DISTANCE = 1.0  # Distance between drones in formation
 CIRCLE_POINTS = 36  # Number of points to discretize the circle
-FLIGHT_SPEED = 0.5  # Speed for drone movement (m/s)
+FLIGHT_SPEED = 1.0  # Speed for drone movement (m/s)
 FORMATION_CHANGE_INTERVAL = 20  # Number of waypoints before changing formation
 
-STAGE3_GRID_RESOLUTION = 0.2  # Grid resolution in meters
-SAFETY_MARGIN_RADIUS = 0.3    # Safety radius for collision detection
-RRT_MAX_ITERATIONS = 3000     # Maximum iterations for RRT algorithm
-RRT_STEP_SIZE = 0.5           # Step size for RRT algorithm
+STAGE3_GRID_RESOLUTION = 0.4  # Grid resolution in meters
+SAFETY_MARGIN_RADIUS = 0.4    # Safety radius for collision detection
+RRT_MAX_ITERATIONS = 1500     # Maximum iterations for RRT algorithm
+RRT_STEP_SIZE = 0.4           # Step size for RRT algorithm
 
 def read_config_from_yaml(file_path: str) -> dict:
     """Read config from yaml file"""
@@ -962,7 +962,7 @@ class SwarmConductor:
         stage_center = stage3_config.get('stage_center', [0.0, -6.0])
         start_point_rel = stage3_config.get('start_point', [-4.0, 0.0])
         end_point_rel = stage3_config.get('end_point', [4.0, 0.0])
-        obstacle_height = stage3_config.get('obstacle_height', 5.0)
+        obstacle_height = 5.0  # Fixed to 5.0
         obstacle_diameter = stage3_config.get('obstacle_diameter', 0.4)
         obstacles_rel = stage3_config.get('obstacles', [])
         
@@ -1001,14 +1001,15 @@ class SwarmConductor:
             obstacle_height
         ]
         
-        grid = Grid3D(min_bounds, max_bounds)
+        # Create a base grid with obstacles
+        base_grid = Grid3D(min_bounds, max_bounds)
         
-        # Add obstacles to the grid
+        # Add obstacles to the base grid
         for obstacle in obstacles:
-            grid.add_cylinder(obstacle, obstacle_diameter/2, obstacle_height)
+            base_grid.add_cylinder(obstacle, obstacle_diameter/2, obstacle_height)
         
         # Plan path for leader
-        planner = RRTPlanner(grid, start_point, end_point)
+        planner = RRTPlanner(base_grid, start_point, end_point)
         leader_path = planner.plan()
         
         if leader_path is None:
@@ -1020,15 +1021,9 @@ class SwarmConductor:
         # Plan paths for followers
         follower_paths = {}
         
-        # Create a copy of the grid for each follower
-        follower_grids = {}
-        
-        for i in range(1, len(self.drones)):
-            follower_grids[i] = Grid3D(min_bounds, max_bounds)
-            
-            # Add obstacles to the grid
-            for obstacle in obstacles:
-                follower_grids[i].add_cylinder(obstacle, obstacle_diameter/2, obstacle_height)
+        # Create a copy of the base grid for each follower
+        # We'll update this grid for each follower with previous drones' paths
+        follower_grid = base_grid.clone()  # Clone the base grid
         
         # Plan path for each follower
         for i, drone in self.drones.items():
@@ -1051,45 +1046,51 @@ class SwarmConductor:
                 end_point[2]
             ]
             
-            # Add previously planned paths as obstacles
+            # Add previously planned paths as obstacles to the follower grid
             for j in range(i):
                 if j == 0:
                     path_to_avoid = leader_path
                 else:
                     path_to_avoid = follower_paths[j]
                 
-                for k in range(len(path_to_avoid) - 1):
-                    # Add path segment as a series of points
-                    p1 = path_to_avoid[k]
-                    p2 = path_to_avoid[k + 1]
-                    
-                    # Number of interpolation points
-                    distance = np.linalg.norm(np.array(p2) - np.array(p1))
-                    num_points = max(2, int(distance / (STAGE3_GRID_RESOLUTION * 2)))
-                    
-                    for n in range(num_points + 1):
-                        alpha = n / num_points
-                        point = p1 * (1 - alpha) + p2 * alpha
-                        
-                        # Add a small cylinder around the point
-                        follower_grids[i].add_cylinder(
-                            [point[0], point[1]], 
-                            SAFETY_MARGIN_RADIUS, 
-                            SAFETY_MARGIN_RADIUS * 2,
-                            point[2] - SAFETY_MARGIN_RADIUS
-                        )
+                # Add path as obstacles
+                self._add_path_as_obstacles(follower_grid, path_to_avoid)
             
-            # Plan path for this follower
-            follower_planner = RRTPlanner(follower_grids[i], follower_start, follower_end)
-            follower_path = follower_planner.plan()
+            # First try to use leader's path with offset
+            offset_path = [np.array([p[0] + offset[0], p[1] + offset[1], p[2]]) for p in leader_path]
             
-            if follower_path is None:
-                print(f"Stage 3: Failed to find a path for follower {i}")
-                # Fall back to using leader's path with offset
-                follower_path = [np.array([p[0] + offset[0], p[1] + offset[1], p[2]]) for p in leader_path]
+            # Check if offset path is collision-free
+            is_offset_path_valid = True
+            
+            # Check each segment of the offset path
+            for k in range(len(offset_path) - 1):
+                p1 = offset_path[k]
+                p2 = offset_path[k + 1]
+                
+                # Check if segment is collision-free
+                if not self._is_path_segment_collision_free(follower_grid, p1, p2):
+                    is_offset_path_valid = False
+                    break
+            
+            if is_offset_path_valid:
+                print(f"Stage 3: Using offset path for follower {i}")
+                follower_path = offset_path
+            else:
+                print(f"Stage 3: Planning new path for follower {i}")
+                # Plan path for this follower using RRT
+                follower_planner = RRTPlanner(follower_grid, follower_start, follower_end)
+                follower_path = follower_planner.plan()
+                
+                if follower_path is None:
+                    print(f"Stage 3: Failed to find a path for follower {i}")
+                    # Fall back to using leader's path with offset
+                    follower_path = offset_path
             
             follower_paths[i] = follower_path
             print(f"Stage 3: Follower {i} path found with {len(follower_path)} waypoints")
+            
+            # Add this follower's path as obstacles for the next follower
+            self._add_path_as_obstacles(follower_grid, follower_path)
         
         # Execute paths
         print("Stage 3: Executing paths")
@@ -1150,6 +1151,70 @@ class SwarmConductor:
         self._move_swarm_to_position(end_point)
         
         print("Stage 3: Forest traversal completed")
+
+    def _add_path_as_obstacles(self, grid, path):
+        """Add a path as obstacles to the grid
+        
+        Args:
+            grid: Grid3D object to update
+            path: List of waypoints to add as obstacles
+        """
+        for k in range(len(path) - 1):
+            # Add path segment as a series of points
+            p1 = path[k]
+            p2 = path[k + 1]
+            
+            # Number of interpolation points
+            distance = np.linalg.norm(np.array(p2) - np.array(p1))
+            num_points = max(2, int(distance / (STAGE3_GRID_RESOLUTION * 2)))
+            
+            for n in range(num_points + 1):
+                alpha = n / num_points
+                point = p1 * (1 - alpha) + p2 * alpha
+                
+                # Add a small cylinder around the point
+                grid.add_cylinder(
+                    [point[0], point[1]], 
+                    SAFETY_MARGIN_RADIUS, 
+                    SAFETY_MARGIN_RADIUS * 2,
+                    point[2] - SAFETY_MARGIN_RADIUS
+                )
+
+    def _is_path_segment_collision_free(self, grid, from_point, to_point):
+        """Check if a path segment is collision-free
+        
+        Args:
+            grid: 3D grid for collision checking
+            from_point: [x, y, z] start point
+            to_point: [x, y, z] end point
+            
+        Returns:
+            True if path segment is collision-free, False otherwise
+        """
+        from_point = np.array(from_point)
+        to_point = np.array(to_point)
+        
+        direction = to_point - from_point
+        distance = np.linalg.norm(direction)
+        
+        if distance < 1e-6:
+            return True  # Points are too close
+        
+        # Normalize direction
+        direction = direction / distance
+        
+        # Number of steps to check
+        num_steps = max(10, int(distance / (STAGE3_GRID_RESOLUTION * 0.5)))
+        
+        # Check points along the path
+        for i in range(num_steps + 1):
+            t = i / num_steps
+            point = from_point + t * direction * distance
+            
+            if grid.is_occupied(point):
+                return False
+        
+        return True
 
 
 class Grid3D:
@@ -1273,6 +1338,17 @@ class Grid3D:
                     
                     if distance <= safe_radius and min_z <= cell_center[2] <= max_z:
                         self.grid[i, j, k] = 1
+
+    def clone(self):
+        """Create a copy of this grid
+        
+        Returns:
+            A new Grid3D object with the same properties and grid data
+        """
+        new_grid = Grid3D(self.min_bounds, self.max_bounds, self.resolution)
+        new_grid.grid = np.copy(self.grid)
+        return new_grid
+
 
 class RRTPlanner:
     """RRT-based path planner"""
