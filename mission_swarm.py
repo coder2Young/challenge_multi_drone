@@ -56,6 +56,7 @@ from as2_python_api.behavior_actions.behavior_handler import BehaviorHandler
 from std_msgs.msg import ColorRGBA
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, Pose, Point
+from queue import PriorityQueue
 
 # Constants for formation and movement
 LAYER_OFFSET = 0.5  # Vertical separation between drones during transitions
@@ -63,6 +64,11 @@ FORMATION_DISTANCE = 1.0  # Distance between drones in formation
 CIRCLE_POINTS = 36  # Number of points to discretize the circle
 FLIGHT_SPEED = 0.5  # Speed for drone movement (m/s)
 FORMATION_CHANGE_INTERVAL = 20  # Number of waypoints before changing formation
+
+STAGE3_GRID_RESOLUTION = 0.2  # Grid resolution in meters
+SAFETY_MARGIN_RADIUS = 0.3    # Safety radius for collision detection
+RRT_MAX_ITERATIONS = 3000     # Maximum iterations for RRT algorithm
+RRT_STEP_SIZE = 0.5           # Step size for RRT algorithm
 
 def read_config_from_yaml(file_path: str) -> dict:
     """Read config from yaml file"""
@@ -945,6 +951,530 @@ class SwarmConductor:
         # All drones are in position
         return True
 
+    def execute_stage3(self, config: dict):
+        """Execute stage 3 - forest traversal
+        
+        Args:
+            config: Configuration dictionary from YAML file
+        """
+        # Extract stage3 configuration
+        stage3_config = config.get('stage3', {})
+        stage_center = stage3_config.get('stage_center', [0.0, -6.0])
+        start_point_rel = stage3_config.get('start_point', [-4.0, 0.0])
+        end_point_rel = stage3_config.get('end_point', [4.0, 0.0])
+        obstacle_height = stage3_config.get('obstacle_height', 5.0)
+        obstacle_diameter = stage3_config.get('obstacle_diameter', 0.4)
+        obstacles_rel = stage3_config.get('obstacles', [])
+        
+        # Convert relative coordinates to absolute
+        start_point = [stage_center[0] + start_point_rel[0], 
+                       stage_center[1] + start_point_rel[1],
+                       1.5]  # Fixed height
+        end_point = [stage_center[0] + end_point_rel[0], 
+                     stage_center[1] + end_point_rel[1],
+                     1.5]  # Fixed height
+        
+        obstacles = []
+        for obs_rel in obstacles_rel:
+            obstacles.append([stage_center[0] + obs_rel[0], stage_center[1] + obs_rel[1]])
+        
+        print(f"Stage 3: Forest traversal from {start_point} to {end_point}")
+        print(f"Stage 3: {len(obstacles)} obstacles")
+        
+        # Change to V formation
+        self.change_formation("v")
+        
+        # Move to start position
+        self._move_swarm_to_position(start_point)
+        
+        # Create 3D grid for the environment
+        # Define grid bounds with some margin
+        margin = 2.0
+        min_bounds = [
+            min(start_point[0], end_point[0]) - margin,
+            min(start_point[1], end_point[1]) - margin,
+            0.0
+        ]
+        max_bounds = [
+            max(start_point[0], end_point[0]) + margin,
+            max(start_point[1], end_point[1]) + margin,
+            obstacle_height
+        ]
+        
+        grid = Grid3D(min_bounds, max_bounds)
+        
+        # Add obstacles to the grid
+        for obstacle in obstacles:
+            grid.add_cylinder(obstacle, obstacle_diameter/2, obstacle_height)
+        
+        # Plan path for leader
+        planner = RRTPlanner(grid, start_point, end_point)
+        leader_path = planner.plan()
+        
+        if leader_path is None:
+            print("Stage 3: Failed to find a path for leader")
+            return
+        
+        print(f"Stage 3: Leader path found with {len(leader_path)} waypoints")
+        
+        # Plan paths for followers
+        follower_paths = {}
+        
+        # Create a copy of the grid for each follower
+        follower_grids = {}
+        
+        for i in range(1, len(self.drones)):
+            follower_grids[i] = Grid3D(min_bounds, max_bounds)
+            
+            # Add obstacles to the grid
+            for obstacle in obstacles:
+                follower_grids[i].add_cylinder(obstacle, obstacle_diameter/2, obstacle_height)
+        
+        # Plan path for each follower
+        for i, drone in self.drones.items():
+            if i == 0:  # Skip leader
+                continue
+            
+            # Get formation offset for this follower
+            offset = self.formation_offsets[i]
+            
+            # Calculate start and end positions with offset
+            follower_start = [
+                start_point[0] + offset[0],
+                start_point[1] + offset[1],
+                start_point[2]
+            ]
+            
+            follower_end = [
+                end_point[0] + offset[0],
+                end_point[1] + offset[1],
+                end_point[2]
+            ]
+            
+            # Add previously planned paths as obstacles
+            for j in range(i):
+                if j == 0:
+                    path_to_avoid = leader_path
+                else:
+                    path_to_avoid = follower_paths[j]
+                
+                for k in range(len(path_to_avoid) - 1):
+                    # Add path segment as a series of points
+                    p1 = path_to_avoid[k]
+                    p2 = path_to_avoid[k + 1]
+                    
+                    # Number of interpolation points
+                    distance = np.linalg.norm(np.array(p2) - np.array(p1))
+                    num_points = max(2, int(distance / (STAGE3_GRID_RESOLUTION * 2)))
+                    
+                    for n in range(num_points + 1):
+                        alpha = n / num_points
+                        point = p1 * (1 - alpha) + p2 * alpha
+                        
+                        # Add a small cylinder around the point
+                        follower_grids[i].add_cylinder(
+                            [point[0], point[1]], 
+                            SAFETY_MARGIN_RADIUS, 
+                            SAFETY_MARGIN_RADIUS * 2,
+                            point[2] - SAFETY_MARGIN_RADIUS
+                        )
+            
+            # Plan path for this follower
+            follower_planner = RRTPlanner(follower_grids[i], follower_start, follower_end)
+            follower_path = follower_planner.plan()
+            
+            if follower_path is None:
+                print(f"Stage 3: Failed to find a path for follower {i}")
+                # Fall back to using leader's path with offset
+                follower_path = [np.array([p[0] + offset[0], p[1] + offset[1], p[2]]) for p in leader_path]
+            
+            follower_paths[i] = follower_path
+            print(f"Stage 3: Follower {i} path found with {len(follower_path)} waypoints")
+        
+        # Execute paths
+        print("Stage 3: Executing paths")
+        
+        # Create and follow path for leader
+        leader_path_msg = Path()
+        leader_path_msg.header.stamp = self.leader.get_clock().now().to_msg()
+        leader_path_msg.header.frame_id = "earth"
+        
+        for point in leader_path:
+            pose = PoseStamped()
+            pose.pose.position.x = float(point[0])
+            pose.pose.position.y = float(point[1])
+            pose.pose.position.z = float(point[2])
+            leader_path_msg.poses.append(pose)
+        
+        # Command leader to follow the path
+        self.leader.do_behavior("follow_path", 
+                               leader_path_msg, 
+                               FLIGHT_SPEED,
+                               YawMode.PATH_FACING, 
+                               0.0, 
+                               "earth", 
+                               False)
+        
+        # Create and follow paths for followers
+        for i, drone in self.drones.items():
+            if i == 0:  # Skip leader
+                continue
+            
+            follower_path = follower_paths[i]
+            
+            # Create path message
+            path_msg = Path()
+            path_msg.header.stamp = drone.get_clock().now().to_msg()
+            path_msg.header.frame_id = "earth"
+            
+            for point in follower_path:
+                pose = PoseStamped()
+                pose.pose.position.x = float(point[0])
+                pose.pose.position.y = float(point[1])
+                pose.pose.position.z = float(point[2])
+                path_msg.poses.append(pose)
+            
+            # Command follower to follow the path
+            drone.do_behavior("follow_path", 
+                             path_msg, 
+                             FLIGHT_SPEED,
+                             YawMode.PATH_FACING, 
+                             0.0, 
+                             "earth", 
+                             False)
+        
+        # Wait for all drones to complete their paths
+        self.wait_all_drones()
+        
+        # Ensure we end in V formation at the end point
+        self._move_swarm_to_position(end_point)
+        
+        print("Stage 3: Forest traversal completed")
+
+
+class Grid3D:
+    """3D grid representation of the environment for collision checking"""
+    
+    def __init__(self, min_bounds, max_bounds, resolution=STAGE3_GRID_RESOLUTION):
+        """Initialize 3D grid
+        
+        Args:
+            min_bounds: [x_min, y_min, z_min] minimum bounds of the grid
+            max_bounds: [x_max, y_max, z_max] maximum bounds of the grid
+            resolution: Grid resolution in meters
+        """
+        self.min_bounds = np.array(min_bounds)
+        self.max_bounds = np.array(max_bounds)
+        self.resolution = resolution
+        
+        # Calculate grid dimensions
+        self.dimensions = np.ceil((self.max_bounds - self.min_bounds) / self.resolution).astype(int)
+        
+        # Initialize empty grid (0 = free, 1 = occupied)
+        self.grid = np.zeros(self.dimensions, dtype=np.uint8)
+        
+        print(f"Created 3D grid with dimensions: {self.dimensions}")
+    
+    def world_to_grid(self, point):
+        """Convert world coordinates to grid indices
+        
+        Args:
+            point: [x, y, z] point in world coordinates
+            
+        Returns:
+            [i, j, k] grid indices
+        """
+        indices = np.floor((np.array(point) - self.min_bounds) / self.resolution).astype(int)
+        return np.clip(indices, 0, self.dimensions - 1)
+    
+    def grid_to_world(self, indices):
+        """Convert grid indices to world coordinates
+        
+        Args:
+            indices: [i, j, k] grid indices
+            
+        Returns:
+            [x, y, z] point in world coordinates
+        """
+        return self.min_bounds + (np.array(indices) + 0.5) * self.resolution
+    
+    def is_valid_index(self, indices):
+        """Check if grid indices are valid
+        
+        Args:
+            indices: [i, j, k] grid indices
+            
+        Returns:
+            True if indices are valid, False otherwise
+        """
+        return (0 <= indices[0] < self.dimensions[0] and
+                0 <= indices[1] < self.dimensions[1] and
+                0 <= indices[2] < self.dimensions[2])
+    
+    def is_occupied(self, point):
+        """Check if a point in world coordinates is occupied
+        
+        Args:
+            point: [x, y, z] point in world coordinates
+            
+        Returns:
+            True if point is occupied, False otherwise
+        """
+        indices = self.world_to_grid(point)
+        if not self.is_valid_index(indices):
+            return True  # Consider out-of-bounds as occupied
+        return self.grid[indices[0], indices[1], indices[2]] == 1
+    
+    def set_occupied(self, point):
+        """Mark a point in world coordinates as occupied
+        
+        Args:
+            point: [x, y, z] point in world coordinates
+        """
+        indices = self.world_to_grid(point)
+        if self.is_valid_index(indices):
+            self.grid[indices[0], indices[1], indices[2]] = 1
+    
+    def add_cylinder(self, center, radius, height, z_base=0):
+        """Add a cylinder to the grid
+        
+        Args:
+            center: [x, y] center of the cylinder base
+            radius: Radius of the cylinder
+            height: Height of the cylinder
+            z_base: Z coordinate of the cylinder base
+        """
+        # Expand radius by safety margin
+        safe_radius = radius + SAFETY_MARGIN_RADIUS
+        
+        # Calculate bounds of the cylinder in grid coordinates
+        min_x, min_y = center[0] - safe_radius, center[1] - safe_radius
+        max_x, max_y = center[0] + safe_radius, center[1] + safe_radius
+        min_z, max_z = z_base, z_base + height
+        
+        # Convert to grid indices
+        min_indices = self.world_to_grid([min_x, min_y, min_z])
+        max_indices = self.world_to_grid([max_x, max_y, max_z])
+        
+        # Iterate over grid cells that might intersect with the cylinder
+        for i in range(min_indices[0], max_indices[0] + 1):
+            for j in range(min_indices[1], max_indices[1] + 1):
+                for k in range(min_indices[2], max_indices[2] + 1):
+                    if not self.is_valid_index([i, j, k]):
+                        continue
+                    
+                    # Get world coordinates of the cell center
+                    cell_center = self.grid_to_world([i, j, k])
+                    
+                    # Check if cell center is inside the cylinder
+                    dx = cell_center[0] - center[0]
+                    dy = cell_center[1] - center[1]
+                    distance = np.sqrt(dx*dx + dy*dy)
+                    
+                    if distance <= safe_radius and min_z <= cell_center[2] <= max_z:
+                        self.grid[i, j, k] = 1
+
+class RRTPlanner:
+    """RRT-based path planner"""
+    
+    def __init__(self, grid, start, goal, step_size=RRT_STEP_SIZE, max_iterations=RRT_MAX_ITERATIONS):
+        """Initialize RRT planner
+        
+        Args:
+            grid: 3D grid for collision checking
+            start: [x, y, z] start position
+            goal: [x, y, z] goal position
+            step_size: Step size for extending the tree
+            max_iterations: Maximum number of iterations
+        """
+        self.grid = grid
+        self.start = np.array(start)
+        self.goal = np.array(goal)
+        self.step_size = step_size
+        self.max_iterations = max_iterations
+        
+        # Tree representation: node -> parent node
+        self.tree = {tuple(self.start): None}
+        
+        # For visualization and debugging
+        self.all_nodes = [self.start]
+    
+    def plan(self):
+        """Run RRT algorithm to find a path
+        
+        Returns:
+            List of waypoints from start to goal, or None if no path found
+        """
+        print(f"Planning path from {self.start} to {self.goal}")
+        
+        for i in range(self.max_iterations):
+            if i % 500 == 0:
+                print(f"RRT iteration {i}/{self.max_iterations}")
+            
+            # With some probability, sample the goal directly
+            if random.random() < 0.1:
+                random_point = self.goal
+            else:
+                random_point = self._sample_random_point()
+            
+            # Find nearest node in the tree
+            nearest_node = self._find_nearest(random_point)
+            
+            # Extend tree towards random point
+            new_node = self._extend(nearest_node, random_point)
+            if new_node is None:
+                continue
+            
+            # Add new node to the tree
+            self.tree[tuple(new_node)] = tuple(nearest_node)
+            self.all_nodes.append(new_node)
+            
+            # Check if we can connect to the goal
+            if np.linalg.norm(np.array(new_node) - self.goal) < self.step_size:
+                if self._is_collision_free(new_node, self.goal):
+                    self.tree[tuple(self.goal)] = tuple(new_node)
+                    print(f"Path found after {i+1} iterations")
+                    return self._extract_path()
+        
+        print("Failed to find a path")
+        return None
+    
+    def _sample_random_point(self):
+        """Sample a random point in the grid
+        
+        Returns:
+            [x, y, z] random point
+        """
+        x = random.uniform(self.grid.min_bounds[0], self.grid.max_bounds[0])
+        y = random.uniform(self.grid.min_bounds[1], self.grid.max_bounds[1])
+        z = random.uniform(self.grid.min_bounds[2], self.grid.max_bounds[2])
+        return np.array([x, y, z])
+    
+    def _find_nearest(self, point):
+        """Find the nearest node in the tree to the given point
+        
+        Args:
+            point: [x, y, z] query point
+            
+        Returns:
+            [x, y, z] nearest node in the tree
+        """
+        min_dist = float('inf')
+        nearest = None
+        
+        for node in self.tree.keys():
+            dist = np.linalg.norm(np.array(node) - point)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = node
+        
+        return np.array(nearest)
+    
+    def _extend(self, from_node, to_point):
+        """Extend tree from a node towards a point
+        
+        Args:
+            from_node: [x, y, z] node to extend from
+            to_point: [x, y, z] point to extend towards
+            
+        Returns:
+            [x, y, z] new node, or None if extension failed
+        """
+        direction = to_point - from_node
+        distance = np.linalg.norm(direction)
+        
+        if distance < 1e-6:
+            return None  # Points are too close
+        
+        # Normalize direction and scale by step size
+        direction = direction / distance
+        new_node = from_node + direction * min(self.step_size, distance)
+        
+        # Check if the path to the new node is collision-free
+        if self._is_collision_free(from_node, new_node):
+            return new_node
+        
+        return None
+    
+    def _is_collision_free(self, from_point, to_point):
+        """Check if a path between two points is collision-free
+        
+        Args:
+            from_point: [x, y, z] start point
+            to_point: [x, y, z] end point
+            
+        Returns:
+            True if path is collision-free, False otherwise
+        """
+        from_point = np.array(from_point)
+        to_point = np.array(to_point)
+        
+        direction = to_point - from_point
+        distance = np.linalg.norm(direction)
+        
+        if distance < 1e-6:
+            return True  # Points are too close
+        
+        # Normalize direction
+        direction = direction / distance
+        
+        # Number of steps to check
+        num_steps = max(10, int(distance / (STAGE3_GRID_RESOLUTION * 0.5)))
+        
+        # Check points along the path
+        for i in range(num_steps + 1):
+            t = i / num_steps
+            point = from_point + t * direction * distance
+            
+            if self.grid.is_occupied(point):
+                return False
+        
+        return True
+    
+    def _extract_path(self):
+        """Extract path from start to goal
+        
+        Returns:
+            List of waypoints from start to goal
+        """
+        path = [self.goal]
+        current = tuple(self.goal)
+        
+        while current != tuple(self.start):
+            current = self.tree[current]
+            path.append(np.array(current))
+        
+        path.reverse()
+        
+        # Simplify the path
+        return self._simplify_path(path)
+    
+    def _simplify_path(self, path):
+        """Simplify path by removing redundant waypoints
+        
+        Args:
+            path: List of waypoints
+            
+        Returns:
+            Simplified list of waypoints
+        """
+        if len(path) <= 2:
+            return path
+        
+        simplified = [path[0]]
+        i = 0
+        
+        while i < len(path) - 1:
+            # Try to connect to furthest possible node
+            for j in range(len(path) - 1, i, -1):
+                if self._is_collision_free(path[i], path[j]):
+                    simplified.append(path[j])
+                    i = j
+                    break
+            i += 1
+        
+        return simplified
+
 
 def confirm(msg: str = 'Continue') -> bool:
     """Confirm message"""
@@ -998,6 +1528,9 @@ def main():
             
         if confirm("Stage 2"):
             swarm.execute_stage2(config)
+
+        if confirm("Stage 3"):
+            swarm.execute_stage3(config)
 
         confirm("Land")
         swarm.land()
