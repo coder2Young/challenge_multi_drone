@@ -533,6 +533,238 @@ class SwarmConductor:
             # Small delay for visualization
             time.sleep(0.1)
 
+    def execute_stage2(self, config: dict):
+        """Execute stage 2 - window traversal with sequential drone movement
+        
+        Args:
+            config: Configuration dictionary from YAML file
+        """
+        # Extract stage2 configuration
+        stage2_config = config.get('stage2', {})
+        stage_center = stage2_config.get('stage_center', [0.0, -6.0])
+        room_height = stage2_config.get('room_height', 5.0)
+        windows = stage2_config.get('windows', {})
+        
+        print(f"Executing Stage 2 with center={stage_center}")
+        
+        # Initialize with V formation
+        self.change_formation("v")
+        
+        # Define waypoints for the leader
+        # First window parameters
+        window1 = windows.get('1', {})
+        window1_center = window1.get('center', [-0.5, 1.5])  # y, x format in YAML
+        # window1_center = [window1_center[1], window1_center[0]]  # Convert to x, y
+        window1_width = window1.get('gap_width', 2.0)
+        window1_height = window1.get('height', 2.0)
+        window1_floor = window1.get('distance_floor', 1.0)
+        window1_thickness = window1.get('thickness', 0.3)
+        
+        # Second window parameters
+        window2 = windows.get('2', {})
+        window2_center = window2.get('center', [1.0, -2.5])  # y, x format in YAML
+        # window2_center = [window2_center[1], window2_center[0]]  # Convert to x, y
+        window2_width = window2.get('gap_width', 1.0)
+        window2_height = window2.get('height', 1.5)
+        window2_floor = window2.get('distance_floor', 3.0)
+        window2_thickness = window2.get('thickness', 0.5)
+        
+        # Calculate absolute positions based on stage center
+        window1_abs_center = [stage_center[0] + window1_center[0], 
+                              stage_center[1] + window1_center[1]]
+        window2_abs_center = [stage_center[0] + window2_center[0], 
+                              stage_center[1] + window2_center[1]]
+        
+        # Define waypoints for the leader's path
+        # Starting position before first window
+        start_pos = [window1_abs_center[0], window1_abs_center[1] + 3.0, 1.5]
+        
+        # Position just before first window
+        pre_window1_pos = [window1_abs_center[0], window1_abs_center[1] + 1.0, 
+                           window1_floor + window1_height/2]
+        
+        # Position just after first window
+        post_window1_pos = [window1_abs_center[0], window1_abs_center[1] - window1_thickness - 1.0, 
+                            window1_floor + window1_height/2]
+        
+        # Position before second window
+        pre_window2_pos = [window2_abs_center[0], window2_abs_center[1] + 1.0, 
+                           window2_floor + window2_height/2]
+        
+        # Position after second window
+        post_window2_pos = [window2_abs_center[0], window2_abs_center[1] - window2_thickness - 1.0, 
+                            window2_floor + window2_height/2]
+        
+        # Final position
+        end_pos = [window2_abs_center[0], window2_abs_center[1] - 3.0, 1.5]
+        
+        print("Stage 2: Moving to start position")
+
+        print(f"Start position: {start_pos}")
+        print(f"Post window 1 position: {post_window1_pos}")
+        print(f"Pre window 2 position: {pre_window2_pos}")
+        print(f"Post window 2 position: {post_window2_pos}")
+        print(f"End position: {end_pos}")
+        
+        # First move the swarm to the starting position in V formation
+        self._move_swarm_to_position(start_pos)
+        
+        print("Stage 2: Sequential window traversal starting")
+        
+        # Store the final positions for each drone
+        final_positions = {}
+        
+        # Calculate final positions for all drones based on formation offsets
+        for i in range(len(self.drones)):
+            if i == 0:
+                # Leader's final position
+                final_positions[i] = end_pos
+            else:
+                # Follower's final position based on formation offset
+                offset = self.formation_offsets[i]
+                final_positions[i] = [
+                    end_pos[0] + offset[0],
+                    end_pos[1] + offset[1],
+                    end_pos[2]
+                ]
+        
+        # Sequential traversal for each drone
+        for i, drone in self.drones.items():
+            print(f"Stage 2: Drone {i} traversing windows")
+            
+            # Drone-specific waypoints
+            if i == 0:
+                # Leader follows the main path
+                waypoints = [
+                    pre_window1_pos,
+                    post_window1_pos,
+                    pre_window2_pos,
+                    post_window2_pos,
+                    end_pos
+                ]
+            else:
+                # Calculate offset waypoints for followers
+                offset = self.formation_offsets[i]
+                
+                # Adjust height for each drone to avoid collisions
+                height_offset = 0.3 * i
+                
+                # Create waypoints with appropriate offsets
+                drone_pre_window1 = [
+                    pre_window1_pos[0],  # Same x as leader for window traversal
+                    pre_window1_pos[1],
+                    pre_window1_pos[2] + height_offset  # Different height
+                ]
+                
+                drone_post_window1 = [
+                    post_window1_pos[0],  # Same x as leader for window traversal
+                    post_window1_pos[1],
+                    post_window1_pos[2] + height_offset  # Different height
+                ]
+                
+                drone_pre_window2 = [
+                    pre_window2_pos[0],  # Same x as leader for window traversal
+                    pre_window2_pos[1],
+                    pre_window2_pos[2] + height_offset  # Different height
+                ]
+                
+                drone_post_window2 = [
+                    post_window2_pos[0],  # Same x as leader for window traversal
+                    post_window2_pos[1],
+                    post_window2_pos[2] + height_offset  # Different height
+                ]
+                
+                waypoints = [
+                    drone_pre_window1,
+                    drone_post_window1,
+                    drone_pre_window2,
+                    drone_post_window2,
+                    final_positions[i]
+                ]
+            
+            # Create a path for the drone to follow
+            path = Path()
+            path.header.stamp = drone.get_clock().now().to_msg()
+            path.header.frame_id = "earth"
+            
+            # Add current position as first waypoint
+            current_pos = drone.position
+            pose_current = PoseStamped()
+            pose_current.pose.position.x = current_pos[0]
+            pose_current.pose.position.y = current_pos[1]
+            pose_current.pose.position.z = current_pos[2]
+            path.poses.append(pose_current)
+            
+            # Add all waypoints to the path
+            for waypoint in waypoints:
+                pose = PoseStamped()
+                pose.pose.position.x = waypoint[0]
+                pose.pose.position.y = waypoint[1]
+                pose.pose.position.z = waypoint[2]
+                path.poses.append(pose)
+            
+            # Command drone to follow the path
+            drone.do_behavior("follow_path", 
+                             path, 
+                             FLIGHT_SPEED,
+                             YawMode.PATH_FACING, 
+                             0.0, 
+                             "earth", 
+                             True)  # Wait for this drone to complete before next drone starts
+            
+            print(f"Stage 2: Drone {i} completed window traversal")
+        
+        print("Stage 2: All drones have traversed the windows")
+        print("Stage 2 completed")
+
+    def _move_swarm_to_position(self, leader_position: List[float]):
+        """Move the entire swarm to a new position while maintaining formation
+        
+        Args:
+            leader_position: [x, y, z] target position for the leader
+        """
+        # Create path for leader (just a single point in this case)
+        leader_path = Path()
+        leader_path.header.stamp = self.leader.get_clock().now().to_msg()
+        leader_path.header.frame_id = "earth"
+        
+        # Add waypoint to leader path
+        pose = PoseStamped()
+        pose.pose.position.x = leader_position[0]
+        pose.pose.position.y = leader_position[1]
+        pose.pose.position.z = leader_position[2]
+        leader_path.poses.append(pose)
+        
+        # Command leader to move to the position
+        self.leader.do_behavior("go_to", 
+                               leader_position[0],
+                               leader_position[1],
+                               leader_position[2],
+                               FLIGHT_SPEED,
+                               YawMode.PATH_FACING, 
+                               0.0, 
+                               "earth", 
+                               False)  # Wait for leader to reach position
+        
+        # Move followers to maintain formation
+        for i, drone in self.drones.items():
+            if i == 0:  # Skip leader
+                continue
+            
+            # Get offset for this drone in the formation
+            offset = self.formation_offsets[i]
+            
+            # Calculate target position based on formation offset
+            target_x = leader_position[0] + offset[0]
+            target_y = leader_position[1] + offset[1]
+            target_z = leader_position[2]
+            
+            # Move follower to its position using layered approach
+            drone.go_to_layered([target_x, target_y, target_z])
+        
+        # Wait for all drones to reach their positions
+        self.wait_all_drones()
+
 
 def confirm(msg: str = 'Continue') -> bool:
     """Confirm message"""
@@ -561,7 +793,7 @@ def main():
                         help='Use simulation time')
     parser.add_argument('-c', '--config',
                         type=str,
-                        default='src/challenge_multi_drone/scenarios/scenario1.yaml',
+                        default='src/challenge_multi_drone/scenarios/scenario2.yaml',
                         help='Path to the config file')
 
     args = parser.parse_args()
@@ -583,6 +815,9 @@ def main():
 
         if confirm("Stage 1"):
             swarm.execute_stage1(config)
+            
+        if confirm("Stage 2"):
+            swarm.execute_stage2(config)
 
         confirm("Land")
         swarm.land()
