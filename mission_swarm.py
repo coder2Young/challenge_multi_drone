@@ -75,7 +75,7 @@ RRT_MAX_ITERATIONS = 1500     # Maximum iterations for RRT algorithm
 RRT_STEP_SIZE = 0.4           # Step size for RRT algorithm
 
 # Add these constants for Stage 4
-OBSTACLE_SAFETY_RADIUS = 0.8  # Safety radius for obstacle detection (m)
+OBSTACLE_SAFETY_RADIUS = 1.0  # Safety radius for obstacle detection (m)
 COLLISION_SAFETY_RADIUS = 0.3  # Minimum distance to avoid collision (m)
 OBSTACLE_VELOCITY_WINDOW = 0.05  # Time window for velocity estimation (s)
 OBSTACLE_CHECK_INTERVAL = 0.1  # Interval for checking obstacle collisions (s)
@@ -478,6 +478,9 @@ class SwarmConductor:
 
     def wait_all_drones(self):
         """Wait until all drones have reached their goals"""
+        # Sleep for 2 second for msg to be published
+        time.sleep(2)
+
         all_finished = False
         while not all_finished:
             all_finished = True
@@ -485,7 +488,7 @@ class SwarmConductor:
                 all_finished = all_finished and drone.goal_reached()
                 if not all_finished:
                     break
-            time.sleep(0.1)  # Small sleep to avoid busy waiting
+            time.sleep(0.2)  # Small sleep to avoid busy waiting
 
     def get_ready(self) -> bool:
         """Arm and offboard for all drones in swarm"""
@@ -536,8 +539,6 @@ class SwarmConductor:
         
         # Update current formation
         self.current_formation = new_formation
-        # Wait for all drones to be ready
-        self.wait_all_drones()
         print(f"Formation changed to {new_formation}")
 
     def apply_formation_at_current_position(self, use_layered: bool = True):
@@ -999,6 +1000,8 @@ class SwarmConductor:
                                  False)
         
         # Wait for all drones to reach their positions
+        # Sleep for 1 second to ensure the msg is sent
+        time.sleep(1.0)
         self.wait_all_drones()
 
     def is_formation_achieved(self) -> bool:
@@ -1327,6 +1330,9 @@ class SwarmConductor:
         
         # Update obstacle position
         self.obstacles[frame_id] = [position, timestamp]
+
+        # Print all obstacles for debugging
+        #print(f"Obstacles: {self.obstacles}")
         
         # Update velocity if we have previous data
         if prev_data:
@@ -1524,14 +1530,35 @@ class SwarmConductor:
         self.change_formation("v")
 
         # Wait for all drones to be ready
+        # Sleep for 1 second to ensure the msg is sent
+        time.sleep(1.0)
         self.wait_all_drones()
         
-        # Move to start position
-        self._move_swarm_to_position(start_point)
-
+        # Get current leader position
+        current_pos = self.leader.position
+        
+        # Create waypoints for high-altitude path to start point
+        high_altitude = 4.0  # 4m above normal flight height
+        waypoints = [
+            # First rise up 5m from current position
+            [current_pos[0], current_pos[1], current_pos[2] + high_altitude],
+            
+            # Then move to above the start point
+            [start_point[0], start_point[1], start_point[2] + high_altitude],
+            
+            # Finally descend to the start point
+            start_point
+        ]
+        
+        # Follow the high-altitude path to start point
+        print("Stage 4: Moving to start position via high-altitude path")
+        self.follow_path_swarm(waypoints)
+        
         # Wait for all drones to reach the start position
+        # Sleep for 1 second to ensure the msg is sent
+        time.sleep(2.0)
         self.wait_all_drones()
-        
+
         print("Stage 4: Reached start position, beginning obstacle avoidance")
         
         # Calculate target positions for each drone based on formation
@@ -1626,6 +1653,54 @@ class SwarmConductor:
         self._move_swarm_to_position(end_point)
         
         print("Stage 4: Dynamic obstacle avoidance completed")
+
+    def follow_path_swarm(self, waypoints: List[List[float]]):
+        """Command the entire swarm to follow a path while maintaining formation
+        
+        Args:
+            waypoints: List of [x, y, z] waypoints for the leader to follow
+        """
+        print(f"Commanding swarm to follow path with {len(waypoints)} waypoints")
+        
+        # Create paths for each drone
+        for i, drone in self.drones.items():
+            # Create a path for this drone
+            path = Path()
+            path.header.stamp = drone.get_clock().now().to_msg()
+            path.header.frame_id = "earth"
+            
+            # Add waypoints to the path with appropriate offsets
+            for waypoint in waypoints:
+                pose = PoseStamped()
+                
+                if i == 0:  # Leader follows the main path
+                    pose.pose.position.x = waypoint[0]
+                    pose.pose.position.y = waypoint[1]
+                    pose.pose.position.z = waypoint[2]
+                else:  # Followers maintain formation
+                    # Get offset for this drone
+                    offset = self.formation_offsets[i]
+                    
+                    # Apply offset to waypoint
+                    pose.pose.position.x = waypoint[0] + offset[0]
+                    pose.pose.position.y = waypoint[1] + offset[1]
+                    pose.pose.position.z = waypoint[2]
+                
+                path.poses.append(pose)
+            
+            # Command drone to follow the path
+            print(f"Drone {i} following path")
+            drone.do_behavior("follow_path", 
+                             path, 
+                             FLIGHT_SPEED,
+                             YawMode.PATH_FACING, 
+                             0.0, 
+                             "earth", 
+                             False)  # Don't wait - we'll wait for all drones together
+        
+        # Wait for all drones to complete their paths
+        self.wait_all_drones()
+        print("All drones completed path")
 
 
 class Grid3D:
