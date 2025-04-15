@@ -21,6 +21,8 @@ if(WIN32)
   )
 endif()
 
+find_package(ament_cmake REQUIRED)
+
 
 # Referencing: https://github.com/gazebosim/ros_gz_project_template/blob/fortress/ros_gz_example_gazebo/CMakeLists.txt 
 find_package(ignition-cmake2 REQUIRED)
@@ -56,3 +58,4 @@ install(TARGETS
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
 
+ament_package()
