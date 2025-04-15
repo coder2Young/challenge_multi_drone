@@ -57,6 +57,10 @@ from std_msgs.msg import ColorRGBA
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, Pose, Point
 from queue import PriorityQueue
+from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+import threading
 
 # Constants for formation and movement
 LAYER_OFFSET = 0.5  # Vertical separation between drones during transitions
@@ -69,6 +73,12 @@ STAGE3_GRID_RESOLUTION = 0.4  # Grid resolution in meters
 SAFETY_MARGIN_RADIUS = 0.4    # Safety radius for collision detection
 RRT_MAX_ITERATIONS = 1500     # Maximum iterations for RRT algorithm
 RRT_STEP_SIZE = 0.4           # Step size for RRT algorithm
+
+# Add these constants for Stage 4
+OBSTACLE_SAFETY_RADIUS = 0.8  # Safety radius for obstacle detection (m)
+COLLISION_SAFETY_RADIUS = 0.3  # Minimum distance to avoid collision (m)
+OBSTACLE_VELOCITY_WINDOW = 0.05  # Time window for velocity estimation (s)
+OBSTACLE_CHECK_INTERVAL = 0.1  # Interval for checking obstacle collisions (s)
 
 def read_config_from_yaml(file_path: str) -> dict:
     """Read config from yaml file"""
@@ -254,6 +264,66 @@ class CircularTrajectoryGenerator:
         return points
 
 
+class DroneInterface(DroneInterface):
+    """Extended drone interface with obstacle avoidance capabilities"""
+    
+    def __init__(self, namespace: str, verbose: bool = False, use_sim_time: bool = False):
+        """Initialize drone interface
+        
+        Args:
+            namespace: Namespace of the drone
+            verbose: Enable verbose output
+            use_sim_time: Use simulation time
+        """
+        super().__init__(namespace, verbose, use_sim_time)
+        
+        # Add velocity tracking
+        self.velocity = [0.0, 0.0, 0.0]  # Current velocity estimate
+        self.last_position = None  # Last known position
+        self.last_position_time = None  # Timestamp of last position
+        
+        # Add target tracking
+        self.current_target = None  # Current target position
+        
+    def update_velocity(self):
+        """Update velocity estimate based on position changes"""
+        current_pos = self.position
+        current_time = time.time()
+        
+        if self.last_position is not None and self.last_position_time is not None:
+            # Calculate time difference
+            dt = current_time - self.last_position_time
+            
+            # Only update if time difference is reasonable
+            if 0.01 <= dt <= 0.1:
+                # Calculate velocity
+                dx = (current_pos[0] - self.last_position[0]) / dt
+                dy = (current_pos[1] - self.last_position[1]) / dt
+                dz = (current_pos[2] - self.last_position[2]) / dt
+                
+                self.velocity = [dx, dy, dz]
+        
+        # Update last position and time
+        self.last_position = current_pos
+        self.last_position_time = current_time
+        
+        return self.velocity
+    
+    def set_current_target(self, target):
+        """Set current target position
+        
+        Args:
+            target: [x, y, z] target position
+        """
+        self.current_target = target
+    
+    def stop_behavior(self):
+        """Stop current behavior"""
+        if self.current_behavior:
+            self.current_behavior.stop()
+            self.current_behavior = None
+
+
 class Dancer(DroneInterface):
     """Drone Interface extended with path to perform and async behavior wait"""
 
@@ -292,12 +362,6 @@ class Dancer(DroneInterface):
         """Start behavior and save current to check if finished or not"""
         self.current_behavior = getattr(self, beh)
         self.current_behavior(*args)
-
-    def stop_behavior(self):
-        """Stop current behavior"""
-        if self.current_behavior:
-            self.current_behavior.stop()
-            self.current_behavior = None
 
     def goal_reached(self) -> bool:
         """Check if current behavior has finished"""
@@ -365,12 +429,18 @@ class Dancer(DroneInterface):
 class SwarmConductor:
     """Swarm Conductor for centralized control of multiple drones"""
 
-    def __init__(self, drones_ns: List[str], verbose: bool = False,
-                 use_sim_time: bool = False):
+    def __init__(self, drones_namespace: List[str], verbose: bool = False, use_sim_time: bool = False):
+        """Initialize swarm conductor
+        
+        Args:
+            drones_namespace: List of drone namespaces
+            verbose: Enable verbose output
+            use_sim_time: Use simulation time
+        """
         self.drones: Dict[int, Dancer] = {}
         
         # Initialize drones
-        for index, name in enumerate(drones_ns):
+        for index, name in enumerate(drones_namespace):
             self.drones[index] = Dancer(name, verbose, use_sim_time)
             self.drones[index].layer = index + 1  # Assign unique layer for collision avoidance
             
@@ -386,6 +456,20 @@ class SwarmConductor:
         self.formation_offsets = []
         self.circle_trajectory = []
         self.current_waypoint_index = 0
+
+        # Add dynamic obstacle tracking
+        self.obstacles = {}  # Dictionary of obstacle positions {frame_id: [position, timestamp]}
+        self.obstacle_velocities = {}  # Dictionary of obstacle velocities {frame_id: [vx, vy, vz]}
+        
+        # Create subscriber for dynamic obstacles
+        self.obstacle_subscriber = self.leader.create_subscription(
+            PoseStamped,
+            '/dynamic_obstacles/locations',
+            self.obstacle_callback,
+            10)
+        
+        # Add collision avoidance flag
+        self.collision_avoidance_active = False
 
     def shutdown(self):
         """Shutdown all drones in swarm"""
@@ -1222,6 +1306,323 @@ class SwarmConductor:
         
         return True
 
+    def obstacle_callback(self, msg):
+        """Callback for dynamic obstacle positions
+        
+        Args:
+            msg: PoseStamped message with obstacle position
+        """
+        frame_id = msg.header.frame_id
+        position = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z
+        ]
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        
+        # Store previous position and timestamp if available
+        prev_data = self.obstacles.get(frame_id)
+        
+        # Update obstacle position
+        self.obstacles[frame_id] = [position, timestamp]
+        
+        # Update velocity if we have previous data
+        if prev_data:
+            prev_position, prev_timestamp = prev_data
+            dt = timestamp - prev_timestamp
+            
+            # Only update velocity if time difference is reasonable
+            if 0.01 <= dt <= 0.1:
+                vx = (position[0] - prev_position[0]) / dt
+                vy = (position[1] - prev_position[1]) / dt
+                vz = (position[2] - prev_position[2]) / dt
+                
+                self.obstacle_velocities[frame_id] = [vx, vy, vz]
+    
+    def check_collision_risk(self, drone_index):
+        """Check if drone is at risk of collision with any obstacle
+        
+        Args:
+            drone_index: Index of the drone to check
+            
+        Returns:
+            Tuple of (is_at_risk, obstacle_id, obstacle_position, obstacle_velocity)
+            or (False, None, None, None) if no risk
+        """
+        drone = self.drones[drone_index]
+        drone_pos = drone.position
+        
+        # Update drone velocity
+        drone.update_velocity()
+        
+        # Check each obstacle
+        for obstacle_id, (obstacle_pos, _) in self.obstacles.items():
+            # Calculate distance to obstacle
+            dx = drone_pos[0] - obstacle_pos[0]
+            dy = drone_pos[1] - obstacle_pos[1]
+            dz = drone_pos[2] - obstacle_pos[2]
+            distance = math.sqrt(dx*dx + dy*dy + dz*dz)
+            
+            # If within safety radius, check for collision risk
+            if distance < OBSTACLE_SAFETY_RADIUS:
+                # Get obstacle velocity
+                obstacle_vel = self.obstacle_velocities.get(obstacle_id, [0.0, 0.0, 0.0])
+                
+                # Check if collision is likely
+                if self.will_collide(drone, obstacle_pos, obstacle_vel):
+                    return True, obstacle_id, obstacle_pos, obstacle_vel
+        
+        return False, None, None, None
+    
+    def will_collide(self, drone, obstacle_pos, obstacle_vel):
+        """Check if drone will collide with obstacle
+        
+        Args:
+            drone: DroneInterface object
+            obstacle_pos: [x, y, z] obstacle position
+            obstacle_vel: [vx, vy, vz] obstacle velocity
+            
+        Returns:
+            True if collision is likely, False otherwise
+        """
+        # If no target, no collision risk
+        if drone.current_target is None:
+            return False
+        
+        # Get drone position and velocity
+        drone_pos = drone.position
+        drone_vel = drone.velocity
+        
+        # Calculate relative position and velocity
+        rel_pos = [
+            drone_pos[0] - obstacle_pos[0],
+            drone_pos[1] - obstacle_pos[1],
+            drone_pos[2] - obstacle_pos[2]
+        ]
+        
+        rel_vel = [
+            drone_vel[0] - obstacle_vel[0],
+            drone_vel[1] - obstacle_vel[1],
+            drone_vel[2] - obstacle_vel[2]
+        ]
+        
+        # Calculate time to closest approach
+        dot_product = rel_pos[0]*rel_vel[0] + rel_pos[1]*rel_vel[1] + rel_pos[2]*rel_vel[2]
+        rel_speed_squared = rel_vel[0]*rel_vel[0] + rel_vel[1]*rel_vel[1] + rel_vel[2]*rel_vel[2]
+        
+        # If relative speed is very small, no collision risk
+        if rel_speed_squared < 0.01:
+            return False
+        
+        # Time to closest approach
+        t_closest = -dot_product / rel_speed_squared
+        
+        # If closest approach is in the past, no collision risk
+        if t_closest < 0:
+            return False
+        
+        # If closest approach is too far in the future, no immediate risk
+        if t_closest > 3.0:  # 3 seconds threshold
+            return False
+        
+        # Calculate position at closest approach
+        closest_pos = [
+            rel_pos[0] + t_closest * rel_vel[0],
+            rel_pos[1] + t_closest * rel_vel[1],
+            rel_pos[2] + t_closest * rel_vel[2]
+        ]
+        
+        # Calculate distance at closest approach
+        closest_distance = math.sqrt(
+            closest_pos[0]*closest_pos[0] + 
+            closest_pos[1]*closest_pos[1] + 
+            closest_pos[2]*closest_pos[2]
+        )
+        
+        # Check if distance is less than safety radius
+        return closest_distance < COLLISION_SAFETY_RADIUS
+    
+    def avoid_obstacle(self, drone_index, obstacle_pos, obstacle_vel):
+        """Implement obstacle avoidance behavior
+        
+        Args:
+            drone_index: Index of the drone
+            obstacle_pos: [x, y, z] obstacle position
+            obstacle_vel: [vx, vy, vz] obstacle velocity
+        """
+        drone = self.drones[drone_index]
+        drone_pos = drone.position
+        
+        # Stop current behavior
+        drone.stop_behavior()
+        
+        # Calculate avoidance direction (perpendicular to obstacle velocity)
+        obstacle_speed = math.sqrt(obstacle_vel[0]*obstacle_vel[0] + obstacle_vel[1]*obstacle_vel[1])
+        
+        if obstacle_speed < 0.1:  # If obstacle is almost stationary
+            # Move away from obstacle
+            dx = drone_pos[0] - obstacle_pos[0]
+            dy = drone_pos[1] - obstacle_pos[1]
+            dist = math.sqrt(dx*dx + dy*dy)
+            
+            if dist < 0.01:  # Avoid division by zero
+                dx, dy = 1.0, 0.0
+            else:
+                dx, dy = dx/dist, dy/dist
+        else:
+            # Move perpendicular to obstacle velocity
+            dx = -obstacle_vel[1] / obstacle_speed
+            dy = obstacle_vel[0] / obstacle_speed
+        
+        # Calculate avoidance target (move 1m in avoidance direction)
+        avoidance_target = [
+            drone_pos[0] + dx * 1.0,
+            drone_pos[1] + dy * 1.0,
+            drone_pos[2]  # Maintain altitude
+        ]
+        
+        print(f"Drone {drone_index} avoiding obstacle, moving to {avoidance_target}")
+        
+        # Command drone to move to avoidance target
+        drone.do_behavior("go_to", 
+                         avoidance_target[0],
+                         avoidance_target[1],
+                         avoidance_target[2],
+                         FLIGHT_SPEED * 0.5,  # Slower speed for avoidance
+                         YawMode.PATH_FACING, 
+                         0.0, 
+                         "earth", 
+                         False)  # Don't wait - we'll monitor progress
+        
+        print(f"Drone {drone_index} avoidance complete")
+    
+    def execute_stage4(self, config: dict):
+        """Execute stage 4 - dynamic obstacle avoidance
+        
+        Args:
+            config: Configuration dictionary from YAML file
+        """
+        # Extract stage4 configuration
+        stage4_config = config.get('stage4', {})
+        stage_center = stage4_config.get('stage_center', [0.0, 6.0])
+        start_point_rel = stage4_config.get('start_point', [4.0, 0.0])
+        end_point_rel = stage4_config.get('end_point', [-4.0, 0.0])
+        
+        # Convert relative coordinates to absolute
+        start_point = [stage_center[0] + start_point_rel[0], 
+                       stage_center[1] + start_point_rel[1],
+                       1.5]  # Fixed height
+        end_point = [stage_center[0] + end_point_rel[0], 
+                     stage_center[1] + end_point_rel[1],
+                     1.5]  # Fixed height
+        
+        print(f"Stage 4: Dynamic obstacle avoidance from {start_point} to {end_point}")
+        
+        # Change to V formation
+        self.change_formation("v")
+
+        # Wait for all drones to be ready
+        self.wait_all_drones()
+        
+        # Move to start position
+        self._move_swarm_to_position(start_point)
+
+        # Wait for all drones to reach the start position
+        self.wait_all_drones()
+        
+        print("Stage 4: Reached start position, beginning obstacle avoidance")
+        
+        # Calculate target positions for each drone based on formation
+        target_positions = {}
+        for i, drone in self.drones.items():
+            if i == 0:  # Leader
+                target_positions[i] = end_point
+            else:
+                # Get offset for this drone
+                offset = self.formation_offsets[i]
+                
+                # Calculate target position with offset
+                target_positions[i] = [
+                    end_point[0] + offset[0],
+                    end_point[1] + offset[1],
+                    end_point[2]
+                ]
+        
+        # Command all drones to move to their targets
+        for i, drone in self.drones.items():
+            target = target_positions[i]
+            print(f"Drone {i} moving to {target}")
+            
+            # Set current target for collision detection
+            drone.set_current_target(target)
+            
+            # Command drone to move to target
+            drone.do_behavior("go_to", 
+                             target[0],
+                             target[1],
+                             target[2],
+                             FLIGHT_SPEED,
+                             YawMode.PATH_FACING, 
+                             0.0, 
+                             "earth", 
+                             False)  # Don't wait - we'll monitor progress
+        
+        # Enable collision avoidance
+        self.collision_avoidance_active = True
+        
+        # Monitor progress and check for collisions
+        all_reached = False
+        while not all_reached:
+            # Check if all drones have reached their targets
+            all_reached = True
+            for i, drone in self.drones.items():
+                # Check if drone is at risk of collision
+                at_risk, obstacle_id, obstacle_pos, obstacle_vel = self.check_collision_risk(i)
+                
+                if at_risk:
+                    print(f"Drone {i} at risk of collision with obstacle {obstacle_id}")
+                    # Implement avoidance behavior
+                    self.avoid_obstacle(i, obstacle_pos, obstacle_vel)
+                    
+                    # After avoidance, resume path to target
+                    target = target_positions[i]
+                    print(f"Drone {i} resuming path to {target}")
+                    
+                    drone.do_behavior("go_to", 
+                                     target[0],
+                                     target[1],
+                                     target[2],
+                                     FLIGHT_SPEED,
+                                     YawMode.PATH_FACING, 
+                                     0.0, 
+                                     "earth", 
+                                     False)
+                
+                # Check if drone has reached its target
+                drone_pos = drone.position
+                target = target_positions[i]
+                
+                dx = drone_pos[0] - target[0]
+                dy = drone_pos[1] - target[1]
+                dz = drone_pos[2] - target[2]
+                distance = math.sqrt(dx*dx + dy*dy + dz*dz)
+                
+                if distance > 0.2:  # 20cm tolerance
+                    all_reached = False
+            
+            # Sleep to avoid busy waiting
+            time.sleep(OBSTACLE_CHECK_INTERVAL)
+        
+        # Disable collision avoidance
+        self.collision_avoidance_active = False
+        
+        print("Stage 4: All drones have reached their targets")
+        
+        # Ensure we end in V formation at the end point
+        self._move_swarm_to_position(end_point)
+        
+        print("Stage 4: Dynamic obstacle avoidance completed")
+
 
 class Grid3D:
     """3D grid representation of the environment for collision checking"""
@@ -1628,6 +2029,10 @@ def main():
                         type=str,
                         default='src/challenge_multi_drone/scenarios/scenario1.yaml',
                         help='Path to the config file')
+    parser.add_argument('-t', '--test',
+                        action='store_true',
+                        default=False,
+                        help='Run test code')
 
     args = parser.parse_args()
     drones_namespace = args.namespaces
@@ -1638,15 +2043,14 @@ def main():
 
     rclpy.init()
 
-    test_code()
-    sys.exit(0)
+    if args.test:
+        test_code()
+        sys.exit(0)
 
     swarm = SwarmConductor(
         drones_namespace,
         verbose=verbosity,
         use_sim_time=use_sim_time)
-    
-    
 
     if confirm("Takeoff"):
         swarm.get_ready()
@@ -1660,6 +2064,9 @@ def main():
 
         if confirm("Stage 3"):
             swarm.execute_stage3(config)
+            
+        if confirm("Stage 4"):
+            swarm.execute_stage4(config)
 
         confirm("Land")
         swarm.land()
